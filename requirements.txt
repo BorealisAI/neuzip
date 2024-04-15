@@ -1,0 +1,11 @@
+accelerate
+bitsandbytes
+datasets
+evaluate
+sacrebleu
+sentencepiece
+torch
+tqdm
+transformers
+trl
+wandb

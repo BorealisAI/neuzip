@@ -1,0 +1,13 @@
+build
+*.egg-info
+*.so
+__pycache__
+.*
+data
+*.logs
+*.log
+*.whl
+*.pyc
+*.png
+results
+dist
