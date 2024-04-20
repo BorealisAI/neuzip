@@ -1,38 +1,79 @@
 // #include <DietGpu.h>
 #include <torch/extension.h>
+
 #include <nvcomp.hpp>
 #include <nvcomp/ans.hpp>
 #include <nvcomp/bitcomp.hpp>
+#include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
 #include <nvcomp/zstd.hpp>
-#include <nvcomp/gdeflate.hpp>
 #include <vector>
 
-#define DEFAULT_PRECISION 20
+#define THREADS 512
 
-#define CUDA_CHECK(cond)                   \
-  do {                                     \
-    cudaError_t err = cond;                \
-    if (err != cudaSuccess) {              \
-      std::cerr << "Failure" << std::endl; \
-      exit(1);                             \
-    }                                      \
+#define CUDA_CHECK(cond)                                             \
+  do {                                                               \
+    cudaError_t err = cond;                                          \
+    if (err != cudaSuccess) {                                        \
+      std::cerr << "Failure\n";                                      \
+      std::cerr << cudaGetErrorString(err) << " " << __FILE__ << ":" \
+                << __LINE__ << std::endl;                            \
+      exit(1);                                                       \
+    }                                                                \
   } while (false)
 
-enum class Algorithm { ans, bitcomp, lz4, zstd, gdeflate};
+template <typename scalar_t,
+          typename frac_t,
+          typename value_t,
+          int frac_len,
+          int exp_len,
+          int precision>
+__global__ void split_kernel(scalar_t* data,
+                             uint8_t* exponents,
+                             uint32_t* fractions,
+                             size_t size) {
+  __shared__ uint32_t fshared[THREADS / 32 * (precision + 1)];
+  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) {
+    return;
+  }
+  uint32_t min_idx = blockIdx.x * blockDim.x;
+  uint32_t max_idx = min_idx + blockDim.x;
+  uint32_t min_block_idx = min_idx * (precision + 1) >> 5;
+  uint32_t max_block_idx = max_idx * (precision + 1) >> 5;
+  uint32_t block_idx = idx * (precision + 1) >> 5;
+  if (threadIdx.x + min_block_idx < max_block_idx) {
+    fshared[threadIdx.x] = 0;
+  }
 
-template <typename frac_t, int frac_len>
-__device__ __forceinline__ frac_t clip_fraction(int real_exponent,
-                                                frac_t fraction,
-                                                int precision) {
-  int last_n = min(frac_len, max(0, -real_exponent + frac_len - precision));
-  return (fraction >> last_n) << last_n;
-}
+  value_t value = *(value_t*)(data + idx);
+  uint32_t sign = (value >> (frac_len + exp_len)) & 0x1;
+  uint32_t repr = value & ((1 << frac_len) - 1);
+  uint32_t shift = 31 - precision - ((idx * (precision + 1)) & 31);
+  uint8_t carry =
+      (frac_len > precision) & ((repr >> (frac_len - precision - 1)) & 1);
 
-template <typename scalar_t, typename frac_t, typename value_t, int frac_len,
-          int exp_len>
-__global__ void split_kernel(scalar_t* data, uint8_t* exponents,
-                             frac_t* fractions, size_t size, int precision) {
+  // repr -> compact fraction
+  repr = repr >> (frac_len - precision);
+
+  uint8_t overflow = (__popc(repr) == precision) & carry;
+
+  // repr -> (sign, compact fraction)
+  repr = (sign << precision) | (((1 << precision) - 1) & (repr + carry));
+  // starting to store the fraction
+  __syncthreads();  // wait for fractions to be initialized
+  atomicOr(fshared + block_idx - min_block_idx, repr << shift);
+
+  uint32_t exponent = (value >> frac_len) & ((1 << exp_len) - 1);
+  // possibly resulting in infinity
+  exponents[idx] = exponent + overflow;
+
+  __syncthreads();  // wait for fractions to be stored
+  if (threadIdx.x + min_block_idx < max_block_idx) {
+    fractions[min_block_idx + threadIdx.x] = fshared[threadIdx.x];
+  }
+
+  /*
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= size) {
     return;
@@ -42,283 +83,304 @@ __global__ void split_kernel(scalar_t* data, uint8_t* exponents,
   value_t value = *(value_t*)(data + idx);
   value_t sign = (value >> (frac_len + exp_len)) & 0x1;
   value_t exponent = (value >> frac_len) & ((1 << exp_len) - 1);
-
-  frac_t fraction = clip_fraction<frac_t, frac_len>(
-      exponent - bias, (value & ((1 << frac_len) - 1)), precision);
+  value_t fraction = value & ((1 << frac_len) - 1);
 
   fractions[idx] = fraction | (sign << frac_len);
   exponents[idx] = exponent;
+  */
 }
 
-template <typename scalar_t, typename frac_t, typename value_t, int frac_len,
-          int exp_len>
-__global__ void merge_kernel(scalar_t* data, uint8_t* exponents,
-                             frac_t* fractions, size_t size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+template <typename scalar_t,
+          typename frac_t,
+          typename value_t,
+          int frac_len,
+          int exp_len,
+          int precision>
+__global__ void merge_kernel(scalar_t* __restrict__ data,
+                             uint8_t* __restrict__ exponents,
+                             uint32_t* __restrict__ fractions,
+                             size_t size) {
+  __shared__ uint32_t fshared[THREADS / 32 * (precision + 1)];
+
+  uint32_t min_idx = blockIdx.x * blockDim.x;
+  uint32_t max_idx = min_idx + blockDim.x;
+
+  uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= size) {
     return;
   }
 
-  value_t exponent = exponents[idx];
-  value_t fraction = fractions[idx] & ((1 << frac_len) - 1);
-  value_t sign = (fractions[idx] >> frac_len) & 0x1;
+  uint32_t min_block_idx = min_idx * (precision + 1) >> 5;
+  uint32_t max_block_idx = max_idx * (precision + 1) >> 5;
+  uint32_t block_idx = idx * (precision + 1) >> 5;
 
-  value_t value =
-      (exponent << frac_len) | fraction | (sign << (frac_len + exp_len));
+  if (threadIdx.x + min_block_idx < max_block_idx) {
+    fshared[threadIdx.x] = fractions[threadIdx.x + min_block_idx];
+  }
+
+  uint32_t shift_right = 31 - precision - ((idx * (precision + 1)) & 31);
+
+  value_t exponent = exponents[idx] << frac_len;
+
+  __syncthreads();
+
+  value_t repr = (fshared[block_idx - min_block_idx] >> shift_right);
+
+  value_t fraction = (repr & ((1 << precision) - 1)) << (frac_len - precision);
+  value_t sign = (repr >> precision) & 0x1;
+
+  value_t value = exponent | fraction | (sign << (frac_len + exp_len));
 
   data[idx] = *(scalar_t*)&value;
 }
 
+enum class Algorithm { ans, bitcomp, lz4, zstd, gdeflate };
+
 // ********** Manager class *************
+
+template <int precision>
 struct Manager {
   const int chunk_size = 1 << 16;
-  cudaStream_t stream;
-  nvcomp::nvcompManagerBase* manager;
-  const int _precision;
+  cudaStream_t stream, fstream, estream;
 
-  Manager(const Algorithm& algorithm, const int& precision = DEFAULT_PRECISION)
-      : _precision(precision) {
+  nvcomp::nvcompManagerBase* emanager;
+
+  uint8_t *gl_exponents, *gl_fractions;
+
+  std::unordered_map<std::string,
+                     std::tuple<torch::Tensor,
+                                nvcomp::CompressionConfig,
+                                torch::Tensor,
+                                nvcomp::CompressionConfig>>
+      compress_cache;
+
+  std::unordered_map<std::string, std::tuple<at::ScalarType, int64_t>>
+      meta_cache;
+
+  Manager(const Algorithm& algorithm) {
     CUDA_CHECK(cudaStreamCreate(&stream));
+    CUDA_CHECK(cudaStreamCreate(&fstream));
+    CUDA_CHECK(cudaStreamCreate(&estream));
 
     if (algorithm == Algorithm::ans) {
-      manager = new nvcomp::ANSManager(chunk_size, nvcompBatchedANSDefaultOpts,
-                                       stream);
+      emanager = new nvcomp::ANSManager(chunk_size, nvcompBatchedANSDefaultOpts,
+                                        estream);
     } else if (algorithm == Algorithm::bitcomp) {
       nvcompBatchedBitcompFormatOpts format_opts{0, NVCOMP_TYPE_UCHAR};
-      manager = new nvcomp::BitcompManager(chunk_size, format_opts, stream);
+
+      emanager = new nvcomp::BitcompManager(chunk_size, format_opts, estream);
     } else if (algorithm == Algorithm::lz4) {
       nvcompBatchedLZ4Opts_t format_opts{NVCOMP_TYPE_CHAR};
-      manager = new nvcomp::LZ4Manager(chunk_size, format_opts, stream);
+      emanager = new nvcomp::LZ4Manager(chunk_size, format_opts, estream);
     } else if (algorithm == Algorithm::zstd) {
-      manager = new nvcomp::ZstdManager(chunk_size,
-                                        nvcompBatchedZstdDefaultOpts, stream);
+      emanager = new nvcomp::ZstdManager(chunk_size,
+                                         nvcompBatchedZstdDefaultOpts, estream);
     } else if (algorithm == Algorithm::gdeflate) {
       // 0: high-thruput, 1: high-comp, 2: entropy-only
       nvcompBatchedGdeflateOpts_t format_opts{2};
-      manager = new nvcomp::GdeflateManager(chunk_size, format_opts, stream);
+      emanager = new nvcomp::GdeflateManager(chunk_size, format_opts, estream);
     } else {
       throw std::runtime_error("Unsupported algorithm");
     }
   }
 
-  ~Manager() {
-    CUDA_CHECK(cudaStreamDestroy(stream));
-    delete manager;
-  }
-
   template <typename T>
-  torch::Tensor _array_compress(size_t size, T* data) {
+  inline std::tuple<torch::Tensor, nvcomp::CompressionConfig> _array_compress(
+      size_t size,
+      T* data,
+      nvcomp::nvcompManagerBase* manager,
+      const cudaStream_t& stream) {
     nvcomp::CompressionConfig comp_config =
         manager->configure_compression(size * sizeof(T));
+
     uint8_t* comp_buffer;
     CUDA_CHECK(
         cudaMalloc(&comp_buffer, comp_config.max_compressed_buffer_size));
+
     manager->compress((uint8_t*)data, comp_buffer, comp_config);
+
     int compressed_size = manager->get_compressed_output_size(comp_buffer);
-    torch::Tensor result = torch::empty(
+
+    torch::Tensor result = torch::zeros(
         {compressed_size},
-        at::TensorOptions().device(at::kCUDA).dtype(at::ScalarType::Byte));
-    cudaMemcpy(result.data_ptr(), comp_buffer, compressed_size,
-               cudaMemcpyDeviceToDevice);
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    // CUDA_CHECK(cudaMallocManaged(&result, compressed_size));
+
+    // CUDA_CHECK(
+    //     cudaMemAdvise(result, compressed_size, cudaMemAdviseSetAccessedBy,
+    //     0));
+    // CUDA_CHECK(cudaMemAdvise(result, compressed_size,
+    //                          cudaMemAdviseSetPreferredLocation, 0));
+
+    CUDA_CHECK(cudaMemcpyAsync(result.data_ptr<uint8_t>(), comp_buffer,
+                               compressed_size, cudaMemcpyDeviceToDevice,
+                               stream));
+
+    // CUDA_CHECK(
+    //     cudaMemAdvise(result, compressed_size, cudaMemAdviseSetReadMostly,
+    //     0));
 
     CUDA_CHECK(cudaFree(comp_buffer));
 
-    return result;
+    return {std::move(result), std::move(comp_config)};
   }
 
-  template <typename scalar_t, typename frac_t, typename value_t, int frac_len,
-            int exp_len, bool compress>
-  std::vector<torch::Tensor> _split_and_compress(torch::Tensor& input,
-                                                 int precision) {
-    const int threads = 1024;
-    size_t size = input.numel();
+  template <typename scalar_t,
+            typename frac_t,
+            typename value_t,
+            int frac_len,
+            int exp_len>
+  void _write_to_cache(const std::string& name, const torch::Tensor& input) {
+    const int threads = THREADS;
+    long size = input.numel();
     int blocks = (size + threads - 1) / threads;
 
-    uint8_t* exponents;
-    frac_t* fractions;
+    CUDA_CHECK(cudaMallocAsync(&gl_exponents, size, estream));
 
-    CUDA_CHECK(cudaMalloc(&exponents, size));
-    CUDA_CHECK(cudaMalloc(&fractions, size * sizeof(frac_t)));
+    long comp_size = (size * (frac_len + 1) + 31) >> 5;
 
-    split_kernel<scalar_t, frac_t, value_t, frac_len, exp_len>
-        <<<blocks, threads>>>(input.data_ptr<scalar_t>(), exponents, fractions,
-                              input.numel(), precision);
+    torch::Tensor fractions_comp = torch::empty(
+        {comp_size},
+        torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCUDA));
 
-    std::vector<torch::Tensor> results;
+    split_kernel<scalar_t, frac_t, value_t, frac_len, exp_len, precision>
+        <<<blocks, threads, 0, estream>>>(
+            input.data_ptr<scalar_t>(), gl_exponents,
+            fractions_comp.data_ptr<uint32_t>(), input.numel());
 
-    if (compress) {
-      results.emplace_back(_array_compress<uint8_t>(size, exponents));
-      results.emplace_back(_array_compress<frac_t>(size, fractions));
-    } else {
-      torch::Tensor exponents_tensor =
-          torch::empty({input.numel()},
-                       at::TensorOptions().device(at::kCUDA).dtype(at::kByte));
-      torch::Tensor fractions_tensor = torch::empty(
-          {input.numel()}, at::TensorOptions().device(at::kCUDA).dtype(
-                               torch::CppTypeToScalarType<frac_t>()));
-      // there is also ScalarTypeToCPPType
-      cudaMemcpyAsync(exponents_tensor.data_ptr(), exponents, size,
-                      cudaMemcpyDeviceToDevice, stream);
-      cudaMemcpyAsync(fractions_tensor.data_ptr(), fractions,
-                      size * sizeof(frac_t), cudaMemcpyDeviceToDevice, stream);
-      results.push_back(exponents_tensor);
-      results.push_back(fractions_tensor);
-    }
+    auto [exponents_comp, exponents_config] =
+        _array_compress<uint8_t>(size, gl_exponents, emanager, estream);
 
-    cudaStreamSynchronize(stream);
+    compress_cache.insert({name,
+                           {std::move(exponents_comp), exponents_config,
+                            std::move(fractions_comp), exponents_config}});
 
-    cudaFree(exponents);
-    cudaFree(fractions);
-
-    return results;
+    CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
   }
 
-  std::vector<torch::Tensor> split_and_compress(torch::Tensor& input) {
-    if (input.device() != torch::kCUDA) {
-      input = input.to(at::kCUDA);
+  void write(const std::string& name, torch::Tensor tensor) {
+    if (!tensor.is_cuda()) {
+      tensor = tensor.to(torch::kCUDA);
     }
-    input = input.reshape({-1});
 
-    std::vector<torch::Tensor> results;
-    if (input.dtype().toScalarType() == at::ScalarType::Float) {
+    if (meta_cache.find(name) != meta_cache.end()) {
+      meta_cache.erase(name);
+      compress_cache.erase(name);
+    }
+
+    // std::cout << "Writing " << name << " to cache" << std::endl;
+
+    // std::cout << "Data type: " << tensor.dtype().toScalarType() <<
+    // std::endl;
+
+    // std::cout << "Shape: " << tensor.sizes() << std::endl;
+
+    meta_cache.insert({name, {tensor.dtype().toScalarType(), tensor.numel()}});
+
+    if (tensor.dtype().toScalarType() == at::ScalarType::Float) {
       const size_t frac_len = 23;
       const size_t exp_len = 8;
-      return _split_and_compress<float, uint32_t, uint32_t, frac_len, exp_len,
-                                 true>(input, _precision);
-    } else if (input.dtype().toScalarType() == at::ScalarType::BFloat16) {
+      return _write_to_cache<float, uint32_t, uint32_t, frac_len, exp_len>(
+          name, tensor);
+    } else if (tensor.dtype().toScalarType() == at::ScalarType::BFloat16) {
       const size_t frac_len = 7;
       const size_t exp_len = 8;
-      return _split_and_compress<at::BFloat16, uint8_t, uint16_t, frac_len,
-                                 exp_len, true>(input, _precision);
-    } else if (input.dtype().toScalarType() == at::ScalarType::Half) {
+      return _write_to_cache<at::BFloat16, uint8_t, uint16_t, frac_len,
+                             exp_len>(name, tensor);
+    } else if (tensor.dtype().toScalarType() == at::ScalarType::Half) {
       const size_t frac_len = 10;
       const size_t exp_len = 5;
-      return _split_and_compress<at::Half, uint16_t, uint16_t, frac_len,
-                                 exp_len, true>(input, _precision);
+      return _write_to_cache<at::Half, uint16_t, uint16_t, frac_len, exp_len>(
+          name, tensor);
     } else {
       throw std::runtime_error("Unsupported data type");
     }
   }
 
-  std::vector<torch::Tensor> split_only(torch::Tensor& input) {
-    if (input.device() != torch::kCUDA) {
-      input = input.to(at::kCUDA);
-    }
-    input = input.reshape({-1});
+  template <typename scalar_t,
+            typename frac_t,
+            typename value_t,
+            size_t frac_len,
+            size_t exp_len>
+  torch::Tensor _decompress_and_merge(const std::string& name, long size) {
+    const int threads = THREADS;
+    const at::ScalarType dtype = torch::CppTypeToScalarType<scalar_t>();
 
-    std::vector<torch::Tensor> results;
-    if (input.dtype().toScalarType() == at::ScalarType::Float) {
-      const size_t frac_len = 23;
-      const size_t exp_len = 8;
-      return _split_and_compress<float, uint32_t, uint32_t, frac_len, exp_len,
-                                 false>(input, _precision);
-    } else if (input.dtype().toScalarType() == at::ScalarType::BFloat16) {
-      const size_t frac_len = 7;
-      const size_t exp_len = 8;
-      return _split_and_compress<at::BFloat16, uint8_t, uint16_t, frac_len,
-                                 exp_len, false>(input, _precision);
-    } else if (input.dtype().toScalarType() == at::ScalarType::Half) {
-      const size_t frac_len = 10;
-      const size_t exp_len = 5;
-      return _split_and_compress<at::Half, uint16_t, uint16_t, frac_len,
-                                 exp_len, false>(input, _precision);
-    } else {
-      throw std::runtime_error("Unsupported data type");
-    }
-  }
+    torch::Tensor result = torch::empty(
+        {size}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
 
-  template <typename scalar_t>
-  torch::Tensor _array_decompress(torch::Tensor& data) {
-    uint8_t* comp_buffer = data.data_ptr<uint8_t>();
-    nvcomp::DecompressionConfig decomp_config =
-        manager->configure_decompression(comp_buffer);
-
-    uint8_t* decomp_buffer;
-    CUDA_CHECK(cudaMalloc(&decomp_buffer, decomp_config.decomp_data_size));
-
-    int size = static_cast<int>(decomp_config.decomp_data_size);
-
-    // std::cout << "Decompressing size: " << size << std::endl;
-
-    manager->decompress(decomp_buffer, comp_buffer, decomp_config);
-
-    // std::cout << "Decompressed" << std::endl;
-
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    // std::cout << "Creating tensor" << std::endl;
-
-    torch::Tensor result =
-        torch::empty({size}, at::TensorOptions().device(at::kCUDA).dtype(
-                                 torch::CppTypeToScalarType<scalar_t>()));
-
-    // std::cout << "Copying to tensor" << std::endl;
-
-    cudaMemcpy((uint8_t*)result.data_ptr(), decomp_buffer, size,
-               cudaMemcpyDeviceToDevice);
-
-    // std::cout << "Freeing memory" << std::endl;
-
-    // CUDA_CHECK(cudaFree(comp_buffer));
-
-    // std::cout << "Freeing memory" << std::endl;
-
-    CUDA_CHECK(cudaFree(decomp_buffer));
-
-    return result;
-  }
-
-  template <typename scalar_t, typename frac_t, typename value_t,
-            size_t frac_len, size_t exp_len>
-  torch::Tensor _decompress_and_merge(torch::Tensor& exponents,
-                                      torch::Tensor& fractions,
-                                      torch::Tensor& result) {
-    const int threads = 1024;
-    size_t size = result.numel();
     int blocks = (size + threads - 1) / threads;
 
-    // std::cout << "Decompressing exponents" << std::endl;
+    auto [exponents_comp, exponents_config, fractions_comp, _] =
+        compress_cache.at(name);
 
-    exponents = _array_decompress<uint8_t>(exponents);
-    fractions = _array_decompress<frac_t>(fractions);
+    nvcomp::DecompressionConfig exp_decomp_config =
+        emanager->configure_decompression(exponents_config);
 
-    at::ScalarType dtype = torch::CppTypeToScalarType<scalar_t>();
+    CUDA_CHECK(cudaMallocAsync(&gl_exponents,
+                               exp_decomp_config.decomp_data_size, estream));
+    emanager->decompress(gl_exponents, exponents_comp.data_ptr<uint8_t>(),
+                         exp_decomp_config);
 
-    merge_kernel<scalar_t, frac_t, value_t, frac_len, exp_len>
-        <<<blocks, threads>>>(result.data_ptr<scalar_t>(),
-                              exponents.data_ptr<uint8_t>(),
-                              fractions.data_ptr<frac_t>(), size);
+    CUDA_CHECK(cudaStreamSynchronize(fstream));
 
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    merge_kernel<scalar_t, frac_t, value_t, frac_len, exp_len, precision>
+        <<<blocks, threads, 0, estream>>>(
+            result.data_ptr<scalar_t>(), gl_exponents,
+            fractions_comp.data_ptr<uint32_t>(), size);
+
+    CUDA_CHECK(cudaStreamSynchronize(estream));
+
+    CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
+
     return result;
   }
 
-  torch::Tensor decompress_and_merge(torch::Tensor& exponents,
-                                     torch::Tensor& fractions,
-                                     torch::Tensor& result) {
-    if (result.dtype().toScalarType() == at::ScalarType::Float) {
+  torch::Tensor read(const std::string& name) {
+    if (meta_cache.find(name) == meta_cache.end()) {
+      throw std::runtime_error("Data not found");
+    }
+
+    auto [dtype, size] = meta_cache.at(name);
+
+    if (dtype == at::ScalarType::Float) {
       const int frac_len = 23;
       const int exp_len = 8;
       return _decompress_and_merge<float, uint32_t, uint32_t, frac_len,
-                                   exp_len>(exponents, fractions, result);
-    } else if (result.dtype().toScalarType() == at::ScalarType::Half) {
+                                   exp_len>(name, size);
+    } else if (dtype == at::ScalarType::Half) {
       const int frac_len = 10;
       const int exp_len = 5;
       return _decompress_and_merge<at::Half, uint16_t, uint16_t, frac_len,
-                                   exp_len>(exponents, fractions, result);
-    } else if (result.dtype().toScalarType() == at::ScalarType::BFloat16) {
+                                   exp_len>(name, size);
+    } else if (dtype == at::ScalarType::BFloat16) {
       const int frac_len = 7;
       const int exp_len = 8;
       return _decompress_and_merge<at::BFloat16, uint8_t, uint16_t, frac_len,
-                                   exp_len>(exponents, fractions, result);
+                                   exp_len>(name, size);
     } else {
       throw std::runtime_error("Unsupported data type");
     }
   }
 };
+
 namespace py = pybind11;
 
-PYBIND11_MODULE(neuzips, m) {
+template <int precision>
+void create_manager_with_precision(py::module& m) {
+  if ((precision + 1) & precision) {
+    throw std::runtime_error("Precision must be (2^n - 1) or (-1)");
+  }
+  const std::string name =
+      precision < 0 ? "Manager" : "ManagerM" + std::to_string(precision);
+  using Class = Manager<precision>;
+  py::class_<Class>(m, name.c_str())
+      .def(py::init<const Algorithm&>(), py::arg("algorithm") = Algorithm::ans)
+      .def("read", &Class::read)
+      .def("write", &Class::write);
+}
+
+PYBIND11_MODULE(neuzips_cuda, m) {
   // m.def("decompress", &decompress, "Decompress data");
   // m.def("compress", &compress, "Compress data");
   // m.def("forward", &forward, "Fetch data from weight");
@@ -329,11 +391,7 @@ PYBIND11_MODULE(neuzips, m) {
       .value("zstd", Algorithm::zstd)
       .value("lz4", Algorithm::lz4)
       .value("gdeflate", Algorithm::gdeflate);
-  py::class_<Manager>(m, "Manager")
-      .def(py::init<const Algorithm&, const int&>(),
-           py::arg("algorithm") = Algorithm::ans,
-           py::arg("precision") = DEFAULT_PRECISION)
-      .def("split_and_compress", &Manager::split_and_compress)
-      .def("split_only", &Manager::split_only)
-      .def("decompress_and_merge", &Manager::decompress_and_merge);
+  create_manager_with_precision<7>(m);
+  create_manager_with_precision<3>(m);
+  create_manager_with_precision<1>(m);
 }
