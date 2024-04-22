@@ -1,6 +1,7 @@
 // #include <DietGpu.h>
 #include <torch/extension.h>
 
+#include <c10/cuda/CUDAGuard.h>
 #include <nvcomp.hpp>
 #include <nvcomp/ans.hpp>
 #include <nvcomp/bitcomp.hpp>
@@ -190,41 +191,63 @@ struct Manager {
     long size = input.numel();
     int blocks = (size + threads - 1) / threads;
 
-    CUDA_CHECK(cudaMallocAsync(&gl_exponents, size, estream));
+    // CUDA_CHECK(cudaMallocAsync(&gl_exponents, size, estream));
 
-    long comp_size = (size * (precision + 1) + 31) >> 5;
+    long frac_size = (size * (precision + 1) + 31) >> 5;
 
     torch::Tensor fractions_comp = torch::empty(
-        {comp_size},
+        {frac_size},
         torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCUDA));
+
+    torch::Tensor exponents_input_buffer = torch::empty(
+        {size},
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
 
     split_kernel<scalar_t, frac_t, value_t, frac_len, exp_len, precision>
         <<<blocks, threads, 0, estream>>>(
-            input.data_ptr<scalar_t>(), gl_exponents,
+            input.data_ptr<scalar_t>(),
+            exponents_input_buffer.data_ptr<uint8_t>(),
             fractions_comp.data_ptr<uint32_t>(), input.numel());
 
     nvcomp::CompressionConfig comp_config =
         emanager->configure_compression(size);
 
-    CUDA_CHECK(cudaMallocAsync(
-        &gl_comp_buffer, comp_config.max_compressed_buffer_size, estream));
-
-    emanager->compress(gl_exponents, gl_comp_buffer, comp_config);
-    CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
-    long compressed_size = emanager->get_compressed_output_size(gl_comp_buffer);
-
-    torch::Tensor exponents_comp = torch::zeros(
-        {compressed_size},
+    // CUDA_CHECK(cudaMallocAsync(
+    //     &gl_comp_buffer, comp_config.max_compressed_buffer_size, estream));
+    // std::cout << "Max compressed buffer size: "
+    //           << static_cast<long>(comp_config.max_compressed_buffer_size)
+    //           << std::endl;
+    torch::Tensor exponents_output_buffer = torch::empty(
+        {static_cast<long>(comp_config.max_compressed_buffer_size)},
         torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
 
-    CUDA_CHECK(cudaMemcpyAsync(exponents_comp.data_ptr<uint8_t>(),
-                               gl_comp_buffer, compressed_size,
-                               cudaMemcpyDeviceToDevice, estream));
-    CUDA_CHECK(cudaFreeAsync(gl_comp_buffer, estream));
+    emanager->compress(exponents_input_buffer.data_ptr<uint8_t>(),
+                       exponents_output_buffer.data_ptr<uint8_t>(),
+                       comp_config);
 
-    compress_cache.insert(
-        {name,
-         {comp_config, std::move(exponents_comp), std::move(fractions_comp)}});
+    // CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
+
+    long compressed_size = emanager->get_compressed_output_size(
+        exponents_output_buffer.data_ptr<uint8_t>());
+
+    // std::cout << "Compressed size: " << compressed_size << std::endl;
+    // option 1: create and copy
+    // torch::Tensor exponents_comp = torch::empty(
+    //     {compressed_size},
+    //     torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+
+    // CUDA_CHECK(cudaMemcpyAsync(exponents_comp.data_ptr<uint8_t>(),
+    //                            exponents_output_buffer.data_ptr<uint8_t>(),
+    //                            compressed_size, cudaMemcpyDeviceToDevice,
+    //                            estream));
+
+    // option 2: slice
+    exponents_output_buffer = exponents_output_buffer.index(
+        {torch::indexing::Slice(0, compressed_size)});
+
+    compress_cache.insert({name,
+                           {comp_config, std::move(exponents_output_buffer),
+                            std::move(fractions_comp)}});
   }
 
   void write(const std::string& name, torch::Tensor tensor) {
@@ -286,19 +309,24 @@ struct Manager {
     nvcomp::DecompressionConfig exp_decomp_config =
         emanager->configure_decompression(exponents_config);
 
-    CUDA_CHECK(cudaMallocAsync(&gl_exponents,
-                               exp_decomp_config.decomp_data_size, estream));
-    emanager->decompress(gl_exponents, exponents_comp.data_ptr<uint8_t>(),
-                         exp_decomp_config);
+    // CUDA_CHECK(cudaMallocAsync(&gl_exponents,
+    //  exp_decomp_config.decomp_data_size, estream));
+    torch::Tensor exponents_output_buffer = torch::empty(
+        {static_cast<long>(exp_decomp_config.decomp_data_size)},
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+
+    emanager->decompress(exponents_output_buffer.data_ptr<uint8_t>(),
+                         exponents_comp.data_ptr<uint8_t>(), exp_decomp_config);
 
     merge_kernel<scalar_t, frac_t, value_t, frac_len, exp_len, precision>
         <<<blocks, threads, 0, estream>>>(
-            result.data_ptr<scalar_t>(), gl_exponents,
+            result.data_ptr<scalar_t>(),
+            exponents_output_buffer.data_ptr<uint8_t>(),
             fractions_comp.data_ptr<uint32_t>(), size);
 
     CUDA_CHECK(cudaStreamSynchronize(estream));
 
-    CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
+    // CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
 
     return result;
   }
@@ -340,6 +368,8 @@ struct Manager {
   }
 };
 
+// ********** Pybind11 *************
+
 namespace py = pybind11;
 
 template <int precision>
@@ -358,10 +388,6 @@ void create_manager_with_precision(py::module& m) {
 }
 
 PYBIND11_MODULE(neuzips_cuda, m) {
-  // m.def("decompress", &decompress, "Decompress data");
-  // m.def("compress", &compress, "Compress data");
-  // m.def("forward", &forward, "Fetch data from weight");
-  // m.def("backward", &backward, "Compress data to weight");
   py::enum_<Algorithm>(m, "Algorithm")
       .value("ans", Algorithm::ans)
       .value("bitcomp", Algorithm::bitcomp)
