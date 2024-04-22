@@ -141,25 +141,21 @@ enum class Algorithm { ans, bitcomp, lz4, zstd, gdeflate };
 template <int precision>
 struct Manager {
   const int chunk_size = 1 << 16;
-  cudaStream_t stream, fstream, estream;
+  cudaStream_t estream;
 
   nvcomp::nvcompManagerBase* emanager;
 
-  uint8_t *gl_exponents, *gl_fractions;
+  uint8_t *gl_exponents, *gl_comp_buffer;
 
-  std::unordered_map<std::string,
-                     std::tuple<torch::Tensor,
-                                nvcomp::CompressionConfig,
-                                torch::Tensor,
-                                nvcomp::CompressionConfig>>
+  std::unordered_map<
+      std::string,
+      std::tuple<nvcomp::CompressionConfig, torch::Tensor, torch::Tensor>>
       compress_cache;
 
   std::unordered_map<std::string, std::tuple<at::ScalarType, int64_t>>
       meta_cache;
 
   Manager(const Algorithm& algorithm) {
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    CUDA_CHECK(cudaStreamCreate(&fstream));
     CUDA_CHECK(cudaStreamCreate(&estream));
 
     if (algorithm == Algorithm::ans) {
@@ -184,47 +180,6 @@ struct Manager {
     }
   }
 
-  template <typename T>
-  inline std::tuple<torch::Tensor, nvcomp::CompressionConfig> _array_compress(
-      size_t size,
-      T* data,
-      nvcomp::nvcompManagerBase* manager,
-      const cudaStream_t& stream) {
-    nvcomp::CompressionConfig comp_config =
-        manager->configure_compression(size * sizeof(T));
-
-    uint8_t* comp_buffer;
-    CUDA_CHECK(
-        cudaMalloc(&comp_buffer, comp_config.max_compressed_buffer_size));
-
-    manager->compress((uint8_t*)data, comp_buffer, comp_config);
-
-    int compressed_size = manager->get_compressed_output_size(comp_buffer);
-
-    torch::Tensor result = torch::zeros(
-        {compressed_size},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
-    // CUDA_CHECK(cudaMallocManaged(&result, compressed_size));
-
-    // CUDA_CHECK(
-    //     cudaMemAdvise(result, compressed_size, cudaMemAdviseSetAccessedBy,
-    //     0));
-    // CUDA_CHECK(cudaMemAdvise(result, compressed_size,
-    //                          cudaMemAdviseSetPreferredLocation, 0));
-
-    CUDA_CHECK(cudaMemcpyAsync(result.data_ptr<uint8_t>(), comp_buffer,
-                               compressed_size, cudaMemcpyDeviceToDevice,
-                               stream));
-
-    // CUDA_CHECK(
-    //     cudaMemAdvise(result, compressed_size, cudaMemAdviseSetReadMostly,
-    //     0));
-
-    CUDA_CHECK(cudaFree(comp_buffer));
-
-    return {std::move(result), std::move(comp_config)};
-  }
-
   template <typename scalar_t,
             typename frac_t,
             typename value_t,
@@ -237,7 +192,7 @@ struct Manager {
 
     CUDA_CHECK(cudaMallocAsync(&gl_exponents, size, estream));
 
-    long comp_size = (size * (frac_len + 1) + 31) >> 5;
+    long comp_size = (size * (precision + 1) + 31) >> 5;
 
     torch::Tensor fractions_comp = torch::empty(
         {comp_size},
@@ -248,14 +203,28 @@ struct Manager {
             input.data_ptr<scalar_t>(), gl_exponents,
             fractions_comp.data_ptr<uint32_t>(), input.numel());
 
-    auto [exponents_comp, exponents_config] =
-        _array_compress<uint8_t>(size, gl_exponents, emanager, estream);
+    nvcomp::CompressionConfig comp_config =
+        emanager->configure_compression(size);
 
-    compress_cache.insert({name,
-                           {std::move(exponents_comp), exponents_config,
-                            std::move(fractions_comp), exponents_config}});
+    CUDA_CHECK(cudaMallocAsync(
+        &gl_comp_buffer, comp_config.max_compressed_buffer_size, estream));
 
+    emanager->compress(gl_exponents, gl_comp_buffer, comp_config);
     CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
+    long compressed_size = emanager->get_compressed_output_size(gl_comp_buffer);
+
+    torch::Tensor exponents_comp = torch::zeros(
+        {compressed_size},
+        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+
+    CUDA_CHECK(cudaMemcpyAsync(exponents_comp.data_ptr<uint8_t>(),
+                               gl_comp_buffer, compressed_size,
+                               cudaMemcpyDeviceToDevice, estream));
+    CUDA_CHECK(cudaFreeAsync(gl_comp_buffer, estream));
+
+    compress_cache.insert(
+        {name,
+         {comp_config, std::move(exponents_comp), std::move(fractions_comp)}});
   }
 
   void write(const std::string& name, torch::Tensor tensor) {
@@ -311,7 +280,7 @@ struct Manager {
 
     int blocks = (size + threads - 1) / threads;
 
-    auto [exponents_comp, exponents_config, fractions_comp, _] =
+    auto [exponents_config, exponents_comp, fractions_comp] =
         compress_cache.at(name);
 
     nvcomp::DecompressionConfig exp_decomp_config =
@@ -321,8 +290,6 @@ struct Manager {
                                exp_decomp_config.decomp_data_size, estream));
     emanager->decompress(gl_exponents, exponents_comp.data_ptr<uint8_t>(),
                          exp_decomp_config);
-
-    CUDA_CHECK(cudaStreamSynchronize(fstream));
 
     merge_kernel<scalar_t, frac_t, value_t, frac_len, exp_len, precision>
         <<<blocks, threads, 0, estream>>>(
@@ -334,6 +301,15 @@ struct Manager {
     CUDA_CHECK(cudaFreeAsync(gl_exponents, estream));
 
     return result;
+  }
+
+  uint64_t size(const std::string& name) {
+    if (compress_cache.find(name) == compress_cache.end()) {
+      return 0;
+    }
+    auto [_, exponents_comp, fractions_comp] = compress_cache.at(name);
+    return exponents_comp.numel() * exponents_comp.element_size() +
+           fractions_comp.numel() * fractions_comp.element_size();
   }
 
   torch::Tensor read(const std::string& name) {
@@ -377,7 +353,8 @@ void create_manager_with_precision(py::module& m) {
   py::class_<Class>(m, name.c_str())
       .def(py::init<const Algorithm&>(), py::arg("algorithm") = Algorithm::ans)
       .def("read", &Class::read)
-      .def("write", &Class::write);
+      .def("write", &Class::write)
+      .def("size", &Class::size);
 }
 
 PYBIND11_MODULE(neuzips_cuda, m) {
@@ -394,4 +371,5 @@ PYBIND11_MODULE(neuzips_cuda, m) {
   create_manager_with_precision<7>(m);
   create_manager_with_precision<3>(m);
   create_manager_with_precision<1>(m);
+  create_manager_with_precision<0>(m);
 }
