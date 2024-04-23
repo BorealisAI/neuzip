@@ -197,17 +197,17 @@ struct Manager {
 
     torch::Tensor fractions_comp = torch::empty(
         {frac_size},
-        torch::TensorOptions().dtype(torch::kUInt32).device(torch::kCUDA));
+        torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
 
     torch::Tensor exponents_input_buffer = torch::empty(
         {size},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
 
     split_kernel<scalar_t, frac_t, value_t, frac_len, exp_len, precision>
         <<<blocks, threads, 0, estream>>>(
             input.data_ptr<scalar_t>(),
             exponents_input_buffer.data_ptr<uint8_t>(),
-            fractions_comp.data_ptr<uint32_t>(), input.numel());
+            (uint32_t*)fractions_comp.data_ptr(), input.numel());
 
     nvcomp::CompressionConfig comp_config =
         emanager->configure_compression(size);
@@ -219,7 +219,7 @@ struct Manager {
     //           << std::endl;
     torch::Tensor exponents_output_buffer = torch::empty(
         {static_cast<long>(comp_config.max_compressed_buffer_size)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
 
     emanager->compress(exponents_input_buffer.data_ptr<uint8_t>(),
                        exponents_output_buffer.data_ptr<uint8_t>(),
@@ -232,22 +232,22 @@ struct Manager {
 
     // std::cout << "Compressed size: " << compressed_size << std::endl;
     // option 1: create and copy
-    // torch::Tensor exponents_comp = torch::empty(
-    //     {compressed_size},
-    //     torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+    torch::Tensor exponents_comp = torch::empty(
+        {compressed_size},
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
 
-    // CUDA_CHECK(cudaMemcpyAsync(exponents_comp.data_ptr<uint8_t>(),
-    //                            exponents_output_buffer.data_ptr<uint8_t>(),
-    //                            compressed_size, cudaMemcpyDeviceToDevice,
-    //                            estream));
+    CUDA_CHECK(cudaMemcpyAsync(exponents_comp.data_ptr<uint8_t>(),
+                               exponents_output_buffer.data_ptr<uint8_t>(),
+                               compressed_size, cudaMemcpyDeviceToDevice,
+                               estream));
 
     // option 2: slice
-    exponents_output_buffer = exponents_output_buffer.index(
-        {torch::indexing::Slice(0, compressed_size)});
+    // exponents_output_buffer = exponents_output_buffer.index(
+    //     {torch::indexing::Slice(0, compressed_size)});
 
-    compress_cache.insert({name,
-                           {comp_config, std::move(exponents_output_buffer),
-                            std::move(fractions_comp)}});
+    compress_cache.insert(
+        {name,
+         {comp_config, std::move(exponents_comp), std::move(fractions_comp)}});
   }
 
   void write(const std::string& name, torch::Tensor tensor) {
@@ -313,7 +313,7 @@ struct Manager {
     //  exp_decomp_config.decomp_data_size, estream));
     torch::Tensor exponents_output_buffer = torch::empty(
         {static_cast<long>(exp_decomp_config.decomp_data_size)},
-        torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA));
+        torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
 
     emanager->decompress(exponents_output_buffer.data_ptr<uint8_t>(),
                          exponents_comp.data_ptr<uint8_t>(), exp_decomp_config);
@@ -322,7 +322,7 @@ struct Manager {
         <<<blocks, threads, 0, estream>>>(
             result.data_ptr<scalar_t>(),
             exponents_output_buffer.data_ptr<uint8_t>(),
-            fractions_comp.data_ptr<uint32_t>(), size);
+            (uint32_t*)fractions_comp.data_ptr(), size);
 
     CUDA_CHECK(cudaStreamSynchronize(estream));
 
@@ -366,7 +366,27 @@ struct Manager {
       throw std::runtime_error("Unsupported data type");
     }
   }
+
+  torch::Tensor linear(const std::string& name,
+                       const torch::Tensor& input,
+                       const at::IntArrayRef& shape,
+                       const bool& transpose = false) {
+    if (transpose) {
+      return torch::matmul(input, this->read(name).view(shape).t());
+    } else {
+      return torch::matmul(input, this->read(name).view(shape));
+    }
+  }
 };
+
+// std::cout << "Compressed size: " << compressed_size << std::endl;
+// option 1: create and copy
+// torch::Tensor exponents_comp = torch::empty(
+//     {compressed_size},
+//     torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
+
+// CUDA_CHECK(cudaMemcpyAsync(exponents_comp.data_ptr<uint8_t>(),
+//
 
 // ********** Pybind11 *************
 
@@ -384,7 +404,8 @@ void create_manager_with_precision(py::module& m) {
       .def(py::init<const Algorithm&>(), py::arg("algorithm") = Algorithm::ans)
       .def("read", &Class::read)
       .def("write", &Class::write)
-      .def("size", &Class::size);
+      .def("size", &Class::size)
+      .def("linear", &Class::linear);
 }
 
 PYBIND11_MODULE(neuzips_cuda, m) {
