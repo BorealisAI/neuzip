@@ -11,7 +11,8 @@
 #include <nvcomp/zstd.hpp>
 #include <vector>
 
-#define THREADS 512
+#define THREADS 1024
+#define EXP_THREASHOLD 120
 
 #define CUDA_CHECK(cond)                                             \
   do {                                                               \
@@ -33,17 +34,27 @@ __device__ __forceinline__ uint32_t _float_to_fraction(float number) {
   return __float_as_uint(number) & ((1 << 23) - 1);
 }
 
-/**
- * Split the input tensor into exponents and fractions. It does two things:
- * 1. Find a normalizer for each block of @p THREADS elements. The normalizer
- * has a sign=0, exponent=0. The fraction is the fraction of the
- * max(abs(element)) in the block. The normalizer is later used to recover the
- * original value.
- * 2. After normalizing, the fraction is stored in the output tensor. The
- * exponent is stored in the output tensor.
- *
- * @
- */
+template <typename scalar_t, /* half, bfloat16 */
+          typename frac_t,   /* uint8_t, uint16_t */
+          typename value_t,  /* uint16_t */
+          int f_bits,        /* 0, 1, 3, 7 */
+          int e_bits,
+          int f_bits_save,
+          int threads_per_block>
+__global__ void kernel_get_full_fraction_if_exponents(
+    uint8_t* __restrict__ exponents,       // in
+    uint8_t* __restrict__ full_fractions,  // out
+    size_t size) {
+  constexpr uint32_t exp_threshold = EXP_THREASHOLD;
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= size) {
+    return;
+  }
+  const uint8_t maybe_full_fraction = (exponents[idx] > exp_threshold) ? 1 : 0;
+
+  full_fractions[idx] = maybe_full_fraction;
+}
+
 template <typename scalar_t, /* half, bfloat16 */
           typename frac_t,   /* uint8_t, uint16_t */
           typename value_t,  /* uint16_t */
@@ -54,7 +65,7 @@ template <typename scalar_t, /* half, bfloat16 */
 __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
                                      uint8_t* __restrict__ exponents,
                                      uint8_t* __restrict__ fractions,
-                                     uint8_t* __restrict__ normalizers,
+                                     uint8_t* __restrict__ full_fractions,
                                      size_t size) {
   // compile-time constants
   constexpr uint32_t threads_per_warp = 32;
@@ -62,13 +73,11 @@ __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
   constexpr uint32_t bytes_per_warp = (f_bits_save + 1) * 4;
   constexpr uint32_t logical_threads_per_warp = 8 / (f_bits_save + 1);
   constexpr uint32_t bytes_per_block = warps_per_block * bytes_per_warp;
+  constexpr uint32_t exp_threshold = EXP_THREASHOLD;
 
-  using BlockReduce = cub::BlockReduce<float, threads_per_block>;
   using WarpReduce = cub::WarpReduce<uint8_t, logical_threads_per_warp>;
 
   __shared__ typename WarpReduce::TempStorage warp_storage[bytes_per_block];
-  __shared__ typename BlockReduce::TempStorage block_storage;
-  __shared__ uint32_t block_normalizer[1];
 
   // dynamic for each thread
   const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -79,42 +88,15 @@ __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
 
   scalar_t scalar = (idx < size) ? data[idx] : static_cast<scalar_t>(0);
 
-  if (true) {
-    // find the normalizer
-
-    // only 1 thread per block has this value
-    float float_block_absmax =
-        BlockReduce(block_storage)
-            .Reduce(abs(static_cast<float>(scalar)), cub::Max());
-
-    // broadcast the normalizer to all threads
-    if (threadIdx.x == 0) {
-      // set exponent to 0x7f;
-      block_normalizer[0] = _float_to_fraction(float_block_absmax);
-    }
-    __syncthreads();
-    float_block_absmax = _fraction_to_base_float(block_normalizer[0]);
-
-    scalar =
-        static_cast<scalar_t>(static_cast<float>(scalar) / float_block_absmax);
-
-    // all threads has the normalizer
-
-    if (threadIdx.x == 0) {
-      normalizers[blockIdx.x] =
-          static_cast<uint8_t>(block_normalizer[0] >> (23 - 8));
-    }
-  }
-
   value_t value = *(value_t*)(&scalar);
   const uint8_t sign = (value >> (f_bits + e_bits)) & 0x1;
-  uint8_t repr = static_cast<uint8_t>(value & ((1 << f_bits) - 1));
+  const uint8_t fraction = static_cast<uint8_t>(value & ((1 << f_bits) - 1));
   const uint8_t carry =
-      (f_bits > f_bits_save) & ((repr >> (f_bits - f_bits_save - 1)) & 1);
+      (f_bits > f_bits_save) & ((fraction >> (f_bits - f_bits_save - 1)) & 1);
   const uint8_t exponent = (value >> f_bits) & ((1 << e_bits) - 1);
 
   // repr -> compact fraction
-  repr = repr >> (f_bits - f_bits_save);
+  uint8_t repr = fraction >> (f_bits - f_bits_save);
 
   uint8_t overflow = (__popc(repr) == f_bits_save) & carry;
 
@@ -142,6 +124,11 @@ __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
   // possibly resulting in infinity
   if (idx < size) {
     exponents[idx] = exponent + overflow;
+    if (exponent + overflow > exp_threshold) {
+      full_fractions[idx] = overflow ? 1 : fraction + 1;
+    } else {
+      full_fractions[idx] = 0;
+    }
   }
 }
 
@@ -155,14 +142,15 @@ template <typename scalar_t,
 __global__ void kernel_aligned_merge(scalar_t* __restrict__ data,
                                      uint8_t* __restrict__ exponents,
                                      uint8_t* __restrict__ fractions,
-                                     uint8_t* __restrict__ normalizers,
+                                     uint8_t* __restrict__ full_fractions,
                                      size_t size) {
   constexpr uint32_t threads_per_warp = 32;
   constexpr uint32_t warps_per_block = threads_per_block / threads_per_warp;
   constexpr uint32_t bytes_per_warp = (f_bits_save + 1) * 4;
   constexpr uint32_t bytes_per_block = warps_per_block * bytes_per_warp;
+  constexpr uint32_t exp_threshold = EXP_THREASHOLD;
 
-  __shared__ uint8_t fshared[bytes_per_block], nshared[1];
+  __shared__ uint8_t fshared[bytes_per_block];
 
   const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t byte_idx = idx * (f_bits_save + 1) / 8;
@@ -170,29 +158,33 @@ __global__ void kernel_aligned_merge(scalar_t* __restrict__ data,
   const uint32_t byte_idx_in_block = threadIdx.x * (f_bits_save + 1) / 8;
   const uint32_t shift = 7 - f_bits_save - bit_idx_in_byte;
 
-  if (threadIdx.x == 0) {
-    nshared[0] = normalizers[blockIdx.x];
-  }
   if (bit_idx_in_byte == 0) {
-    // load in shared memory to avoid reading from global memory multiple times
+    // load in shared memory to avoid reading from global memory multiple
+    // times
     fshared[byte_idx_in_block] = fractions[byte_idx];
   }
 
-  const value_t exponent = exponents[idx] << f_bits;
+  // assert that the exponents are in the correct range
+
+  value_t exponent = exponents[idx];
+  uint8_t maybe_full_fraction =
+      (exponent > exp_threshold) ? full_fractions[idx] - 1 : 0;
+
   __syncthreads();
 
   const value_t repr = (fshared[byte_idx_in_block] >> shift);
 
-  const value_t fraction = (repr & ((1 << f_bits_save) - 1))
-                           << (f_bits - f_bits_save);
+  const value_t fraction =
+      maybe_full_fraction
+          ? maybe_full_fraction
+          : ((repr & ((1 << f_bits_save) - 1)) << (f_bits - f_bits_save));
   const value_t sign = (repr >> f_bits_save) & 0x1;
 
-  const value_t value = (sign << (f_bits + e_bits)) | (exponent) | fraction;
+  const value_t value =
+      (sign << (f_bits + e_bits)) | (exponent << f_bits) | fraction;
 
   if (idx < size) {
-    data[idx] =
-        (*(scalar_t*)&value) *
-        _fraction_to_base_float(static_cast<uint32_t>(nshared[0]) << (23 - 8));
+    data[idx] = *(scalar_t*)&value;
   }
 }
 
@@ -209,9 +201,11 @@ struct Manager {
 
   uint8_t *gl_exponents, *gl_comp_buffer;
 
-  std::unordered_map<
-      std::string,
-      std::tuple<nvcomp::CompressionConfig, torch::Tensor, torch::Tensor, torch::Tensor>>
+  std::unordered_map<std::string,
+                     std::tuple<nvcomp::CompressionConfig,
+                                torch::Tensor,
+                                torch::Tensor,
+                                torch::Tensor>>
       compress_cache;
 
   std::unordered_map<std::string, std::tuple<at::ScalarType, int64_t>>
@@ -262,15 +256,18 @@ struct Manager {
         {size},
         torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
 
-    torch::Tensor normalizers = torch::empty(
-        {blocks},
+    torch::Tensor full_fractions = torch::empty(
+        {size},
         torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
 
     kernel_aligned_split<scalar_t, frac_t, value_t, f_bits, e_bits, f_bits_save,
                          threads><<<blocks, threads, 0, estream>>>(
         input.data_ptr<scalar_t>(), exponents_input_buffer.data_ptr<uint8_t>(),
-        fractions_comp.data_ptr<uint8_t>(), normalizers.data_ptr<uint8_t>(),
+        fractions_comp.data_ptr<uint8_t>(), full_fractions.data_ptr<uint8_t>(),
         input.numel());
+
+    full_fractions =
+        full_fractions.index_select(0, full_fractions.nonzero().squeeze());
 
     nvcomp::CompressionConfig comp_config =
         emanager->configure_compression(size);
@@ -311,7 +308,7 @@ struct Manager {
     compress_cache.insert(
         {name,
          {comp_config, std::move(exponents_comp), std::move(fractions_comp),
-          std::move(normalizers)}});
+          std::move(full_fractions)}});
   }
 
   void write(const std::string& name, torch::Tensor tensor) {
@@ -362,12 +359,9 @@ struct Manager {
     constexpr int threads = THREADS;
     const at::ScalarType dtype = torch::CppTypeToScalarType<scalar_t>();
 
-    torch::Tensor result = torch::empty(
-        {size}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
-
     int blocks = (size + threads - 1) / threads;
 
-    auto [exponents_config, exponents_comp, fractions_comp, normalizers_comp] =
+    auto [exponents_config, exponents_comp, fractions_comp, c_full_fractions] =
         compress_cache.at(name);
 
     nvcomp::DecompressionConfig exp_decomp_config =
@@ -382,12 +376,33 @@ struct Manager {
     emanager->decompress(exponents_output_buffer.data_ptr<uint8_t>(),
                          exponents_comp.data_ptr<uint8_t>(), exp_decomp_config);
 
+    // torch::Tensor full_fractions = torch::empty(
+    //     {size},
+    //     torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA));
+
+    // kernel_get_full_fraction_if_exponents<scalar_t, frac_t, value_t, f_bits,
+    //                                       e_bits, f_bits_save, threads>
+    //     <<<blocks, threads, 0, estream>>>(
+    //         exponents_output_buffer.data_ptr<uint8_t>(),
+    //         full_fractions.data_ptr<uint8_t>(), size);
+
+    // CUDA_CHECK(cudaStreamSynchronize(estream));
+    torch::Tensor full_fractions =
+        torch::empty_like(exponents_output_buffer)
+            .index_put_({(exponents_output_buffer > EXP_THREASHOLD)
+                             .nonzero()
+                             .squeeze()},
+                        c_full_fractions);
+
+    torch::Tensor result = torch::empty(
+        {size}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+
     kernel_aligned_merge<scalar_t, frac_t, value_t, f_bits, e_bits, f_bits_save,
                          threads><<<blocks, threads, 0, estream>>>(
         result.data_ptr<scalar_t>(),
         exponents_output_buffer.data_ptr<uint8_t>(),
-        fractions_comp.data_ptr<uint8_t>(),
-        normalizers_comp.data_ptr<uint8_t>(), size);
+        fractions_comp.data_ptr<uint8_t>(), full_fractions.data_ptr<uint8_t>(),
+        size);
 
     CUDA_CHECK(cudaStreamSynchronize(estream));
 
@@ -400,11 +415,11 @@ struct Manager {
     if (compress_cache.find(name) == compress_cache.end()) {
       return 0;
     }
-    auto [_, exponents_comp, fractions_comp, normalizers_comp] =
+    auto [_, exponents_comp, fractions_comp, c_full_fractions] =
         compress_cache.at(name);
     return exponents_comp.numel() * exponents_comp.element_size() +
            fractions_comp.numel() * fractions_comp.element_size() +
-           normalizers_comp.numel() * normalizers_comp.element_size();
+           c_full_fractions.numel() * c_full_fractions.element_size();
   }
 
   torch::Tensor read(const std::string& name) {
