@@ -2,7 +2,6 @@
 #include <torch/extension.h>
 
 #include <c10/cuda/CUDAGuard.h>
-#include <curand_kernel.h>
 #include <cub/cub.cuh>
 #include <nvcomp.hpp>
 #include <nvcomp/ans.hpp>
@@ -47,16 +46,6 @@ __device__ __forceinline__ T _shift_and_around(T bits, uint32_t shift) {
   return (bits >> shift) + overflow;
 }
 
-__global__ void kernel_setup_random_state(curandState_t* states,
-                                          uint64_t seed) {
-  curand_init(seed, threadIdx.x, 0, &states[threadIdx.x]);
-}
-
-__global__ void kernel_advance_random_state(curandState_t* states,
-                                            unsigned long long step) {
-  skipahead(step, &states[threadIdx.x]);
-}
-
 /**
  * Split the input tensor into exponents and fractions. It does two things:
  * 1. Find a normalizer for each block of @p THREADS elements. The normalizer
@@ -77,13 +66,11 @@ template <typename scalar_t, /* half, bfloat16 */
           int threads_per_block,
           int threads_per_normalizer,
           bool squared,
-          bool normalized,
-          bool stochastic>
+          bool normalized>
 __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
                                      uint8_t* __restrict__ exponents,
                                      uint8_t* __restrict__ fractions,
                                      uint8_t* __restrict__ normalizers,
-                                     curandState_t* states,
                                      size_t size) {
   // compile-time constants
   constexpr uint32_t threads_per_warp = 32;
@@ -111,9 +98,6 @@ __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
   const uint32_t normalizer_idx = threadIdx.x / threads_per_normalizer;
   const uint32_t normalizer_mod = threadIdx.x % threads_per_normalizer;
   scalar_t scalar = (idx < size) ? data[idx] : static_cast<scalar_t>(0);
-
-  curandState_t state = states[threadIdx.x];
-  skipahead(blockIdx.x, &state);
 
   if (normalized) {
     // find the normalizer
@@ -166,13 +150,10 @@ __global__ void kernel_aligned_split(scalar_t* __restrict__ data,
   const uint8_t sign = (value >> (f_bits + e_bits)) & 0x1;
   uint8_t repr = static_cast<uint8_t>(value & ((1 << f_bits) - 1));
   uint8_t carry;
-  if (!stochastic) {
-    carry =
-        (f_bits > f_bits_save) ? ((repr >> (f_bits - f_bits_save - 1)) & 1) : 0;
-  } else {
-    const uint8_t rd = curand(&state) & ((1 << f_bits) - 1);
-    carry = (repr > rd) ? 1 : 0;
-  }
+
+  carry =
+      (f_bits > f_bits_save) ? ((repr >> (f_bits - f_bits_save - 1)) & 1) : 0;
+
   const uint8_t exponent = (value >> f_bits) & ((1 << e_bits) - 1);
 
   // repr -> compact fraction
@@ -278,10 +259,7 @@ enum class Algorithm { ans, bitcomp, lz4, zstd, gdeflate };
 
 // ********** Manager class *************
 
-template <int f_bits_save,
-          int threads_per_normalizer,
-          bool squared,
-          bool stochastic>
+template <int f_bits_save, int threads_per_normalizer, bool squared>
 struct Manager {
   const int chunk_size = 1 << 16;
   cudaStream_t estream;
@@ -300,14 +278,8 @@ struct Manager {
   std::unordered_map<std::string, std::tuple<at::ScalarType, int64_t>>
       meta_cache;
 
-  curandState_t* states;
-
   Manager(const Algorithm& algorithm, uint64_t seed = 0) {
     CUDA_CHECK(cudaStreamCreate(&estream));
-    for (int i = 0; i < THREADS; i++) {
-      CUDA_CHECK(cudaMalloc(&states, THREADS * sizeof(curandState_t)));
-      kernel_setup_random_state<<<1, THREADS>>>(states, seed);
-    }
 
     if (algorithm == Algorithm::ans) {
       emanager = new nvcomp::ANSManager(chunk_size, nvcompBatchedANSDefaultOpts,
@@ -357,12 +329,11 @@ struct Manager {
 
     kernel_aligned_split<scalar_t, frac_t, value_t, f_bits, e_bits, f_bits_save,
                          threads, threads_per_normalizer, squared,
-                         (threads_per_normalizer != 0), stochastic>
+                         (threads_per_normalizer != 0)>
         <<<blocks, threads, 0, estream>>>(
             input.data_ptr<scalar_t>(),
             exponents_input_buffer.data_ptr<uint8_t>(),
-            fractions_comp.data_ptr<uint8_t>(), normalizers.data_ptr<uint8_t>(),
-            states, input.numel());
+            fractions_comp.data_ptr<uint8_t>(), normalizers.data_ptr<uint8_t>(), input.numel());
 
     nvcomp::CompressionConfig comp_config =
         emanager->configure_compression(size);
@@ -399,8 +370,6 @@ struct Manager {
     // option 2: slice
     // exponents_output_buffer = exponents_output_buffer.index(
     //     {torch::indexing::Slice(0, compressed_size)});
-
-    kernel_advance_random_state<<<1, THREADS, 0, estream>>>(states, blocks);
 
     compress_cache.insert(
         {name,
@@ -576,11 +545,11 @@ struct Manager {
 
     kernel_aligned_split<scalar_t, frac_t, value_t, f_bits, e_bits, 7, threads,
                          threads_per_normalizer, false,
-                         (threads_per_normalizer != 0), stochastic>
+                         (threads_per_normalizer != 0)>
         <<<blocks, threads, 0, estream>>>(
             input.data_ptr<scalar_t>(), exponents.data_ptr<uint8_t>(),
             fractions.data_ptr<uint8_t>(), normalizers.data_ptr<uint8_t>(),
-            states, input.numel());
+            input.numel());
 
     return {exponents, fractions};
   }
@@ -620,8 +589,8 @@ constexpr void create_manager(py::module& m) {
 
   std::string name = "Manager_f" + std::to_string(f_bits_save) + "_n" +
                      std::to_string(threads_per_normalizer) +
-                     (false ? "_sqt" : "_sqf") + (false ? "_srt" : "_srf");
-  using Class0 = Manager<f_bits_save, threads_per_normalizer, false, false>;
+                     (false ? "_sqt" : "_sqf");
+  using Class0 = Manager<f_bits_save, threads_per_normalizer, false>;
   py::class_<Class0>(m, name.c_str())
       .def(py::init<const Algorithm&, uint64_t>(),
            py::arg("algorithm") = Algorithm::ans, py::arg("seed") = 0)
@@ -632,22 +601,8 @@ constexpr void create_manager(py::module& m) {
       .def("split", &Class0::split);
 
   name = "Manager_f" + std::to_string(f_bits_save) + "_n" +
-         std::to_string(threads_per_normalizer) + (false ? "_sqt" : "_sqf") +
-         (true ? "_srt" : "_srf");
-  using Class1 = Manager<f_bits_save, threads_per_normalizer, false, true>;
-  py::class_<Class1>(m, name.c_str())
-      .def(py::init<const Algorithm&, uint64_t>(),
-           py::arg("algorithm") = Algorithm::ans, py::arg("seed") = 0)
-      .def("read", &Class1::read)
-      .def("write", &Class1::write)
-      .def("size", &Class1::size)
-      .def("linear", &Class1::linear)
-      .def("split", &Class1::split);
-
-  name = "Manager_f" + std::to_string(f_bits_save) + "_n" +
-         std::to_string(threads_per_normalizer) + (true ? "_sqt" : "_sqf") +
-         (false ? "_srt" : "_srf");
-  using Class2 = Manager<f_bits_save, threads_per_normalizer, true, false>;
+         std::to_string(threads_per_normalizer) + (true ? "_sqt" : "_sqf");
+  using Class2 = Manager<f_bits_save, threads_per_normalizer, true>;
   py::class_<Class2>(m, name.c_str())
       .def(py::init<const Algorithm&, uint64_t>(),
            py::arg("algorithm") = Algorithm::ans, py::arg("seed") = 0)
@@ -656,19 +611,6 @@ constexpr void create_manager(py::module& m) {
       .def("size", &Class2::size)
       .def("linear", &Class2::linear)
       .def("split", &Class2::split);
-
-  name = "Manager_f" + std::to_string(f_bits_save) + "_n" +
-         std::to_string(threads_per_normalizer) + (true ? "_sqt" : "_sqf") +
-         (true ? "_srt" : "_srf");
-  using Class3 = Manager<f_bits_save, threads_per_normalizer, true, true>;
-  py::class_<Class3>(m, name.c_str())
-      .def(py::init<const Algorithm&, uint64_t>(),
-           py::arg("algorithm") = Algorithm::ans, py::arg("seed") = 0)
-      .def("read", &Class3::read)
-      .def("write", &Class3::write)
-      .def("size", &Class3::size)
-      .def("linear", &Class3::linear)
-      .def("split", &Class3::split);
 }
 
 // const std::string name = "Manager_f" + std::to_string(f_bits_save) + "_n" +
