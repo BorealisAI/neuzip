@@ -11,7 +11,11 @@ import torch
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
+<<<<<<< HEAD
 NEUZIP_VERSION = "0.0.1"
+=======
+NEUZIPS_VERSION = "0.0.1"
+>>>>>>> a9c9949 (Sync ABI version with pytorch)
 
 setup(
     name="neuzip",
