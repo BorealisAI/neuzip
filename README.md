@@ -24,7 +24,7 @@ cd neuzip
 pip install -e .
 ```
 
-# Basci usage
+# Basic usage
 
 Using `neuzip` for your PyTorch model is pretty easy. Here is a simple example:
 
