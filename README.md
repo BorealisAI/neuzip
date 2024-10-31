@@ -1,29 +1,41 @@
 # NeuZip: Memory-Efficient Training and Inference with Dynamic Compression of Neural Networks
 
-This is the official repository for the paper "NeuZip: Memory-Efficient Training and Inference with Dynamic Compression of Neural Networks".
-This repository contains the code for the experiments in the paper.
+This is the official repository for the paper [*NeuZip: Memory-Efficient Training and Inference with Dynamic Compression of Neural Networks*](https://arxiv.org/abs/2410.20650). This repository contains the code for the experiments in the paper.
 
 # Installation
 
-First, please install NVComp library on your own. You can find the installation instructions on its [GitHub page](https://github.com/NVIDIA/nvcomp).
+## From PyPI
 
-Then, you can install the package by running the following command in the root directory of the repository:
+We provide a simple way to install the package from PyPI. You can install the package by running the following command:
 
 ```bash
+pip install neuzip
+```
+
+Note that we only upload the source distribution to PyPI. You need to have NVCC correctly installed on your system to compile the package.
+
+## From source
+
+You can also install the package from source, which is useful if you want to modify the code.
+
+```bash
+git clone https://github.com/BorealisAI/neuzip
+cd neuzip
 pip install -e .
 ```
 
-# Usage
+# Basci usage
 
-You can use the `neuzip` package to compress and decompress tensors. Here is an example:
+Using `neuzip` for your PyTorch model is pretty easy. Here is a simple example:
 
-```python
-import neuzip
-manager = neuzip.Manager()  # Create a manager
-handle = manager.write(tensor)  # Compress a tensor
-tensor = manager.read(handle)  # Decompress a tensor
+```diff
+model: torch.nn.Module = # your model
++ manager = neuzip.Manager()
++ model = manager.convert(model)
 ```
 
-# Replicating Experiments
+The compressed model can be used in the same way as the original model while consuming less memory.
+
+# Replicating experiments
 
 You can replicate all the experiments in the paper by using the files in the [examples/](examples/) directory. Each file corresponds to one or more experiments in the paper.
